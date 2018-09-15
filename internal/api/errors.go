@@ -5,29 +5,29 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	"github.com/brocaar/loraserver/internal/downlink"
-	"github.com/brocaar/loraserver/internal/gateway"
-	"github.com/brocaar/loraserver/internal/session"
+	"github.com/brocaar/loraserver/internal/downlink/data"
+	"github.com/brocaar/loraserver/internal/downlink/multicast"
+	"github.com/brocaar/loraserver/internal/downlink/proprietary"
+	"github.com/brocaar/loraserver/internal/storage"
 )
 
 var errToCode = map[error]codes.Code{
-	downlink.ErrFPortMustNotBeZero:     codes.InvalidArgument,
-	downlink.ErrFPortMustBeZero:        codes.InvalidArgument,
-	downlink.ErrNoLastRXInfoSet:        codes.FailedPrecondition,
-	downlink.ErrInvalidDataRate:        codes.Internal,
-	downlink.ErrMaxPayloadSizeExceeded: codes.InvalidArgument,
+	data.ErrFPortMustNotBeZero:     codes.InvalidArgument,
+	data.ErrFPortMustBeZero:        codes.InvalidArgument,
+	data.ErrNoLastRXInfoSet:        codes.FailedPrecondition,
+	data.ErrInvalidDataRate:        codes.Internal,
+	data.ErrMaxPayloadSizeExceeded: codes.InvalidArgument,
 
-	gateway.ErrDoesNotExist:               codes.NotFound,
-	gateway.ErrAlreadyExists:              codes.AlreadyExists,
-	gateway.ErrInvalidAggregationInterval: codes.InvalidArgument,
-	gateway.ErrInvalidName:                codes.InvalidArgument,
-	gateway.ErrInvalidBand:                codes.InvalidArgument,
-	gateway.ErrInvalidChannel:             codes.InvalidArgument,
-	gateway.ErrInvalidChannelConfig:       codes.InvalidArgument,
-	gateway.ErrInvalidChannelModulation:   codes.InvalidArgument,
+	proprietary.ErrInvalidDataRate: codes.Internal,
 
-	session.ErrDoesNotExistOrFCntOrMICInvalid: codes.NotFound,
-	session.ErrDoesNotExist:                   codes.NotFound,
+	multicast.ErrInvalidFCnt: codes.InvalidArgument,
+
+	storage.ErrAlreadyExists:                  codes.AlreadyExists,
+	storage.ErrDoesNotExistOrFCntOrMICInvalid: codes.NotFound,
+	storage.ErrDoesNotExist:                   codes.NotFound,
+	storage.ErrInvalidName:                    codes.InvalidArgument,
+	storage.ErrInvalidAggregationInterval:     codes.InvalidArgument,
+	storage.ErrInvalidFPort:                   codes.InvalidArgument,
 }
 
 func errToRPCError(err error) error {

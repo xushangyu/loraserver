@@ -1,7 +1,6 @@
 # LoRa Server
 
 [![Build Status](https://travis-ci.org/brocaar/loraserver.svg?branch=master)](https://travis-ci.org/brocaar/loraserver)
-[![Gitter chat](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/loraserver/loraserver)
 
 LoRa Server is an open-source LoRaWAN network-server, part of the
 [LoRa Server](https://docs.loraserver.io/) project. It is responsible for
@@ -29,12 +28,12 @@ and the scheduling of downlink data transmissions.
 * [Contributing](https://docs.loraserver.io/loraserver/community/contribute/)
 * Support
   * [Support forum](https://forum.loraserver.io)
-  * [Support chat](https://gitter.im/loraserver/loraserver)
   * [Bug or feature requests](https://github.com/brocaar/loraserver/issues)
 
 ## Sponsors
 
 [![CableLabs](https://www.loraserver.io/img/sponsors/cablelabs.png)](https://www.cablelabs.com/)
+[![SIDNFonds](https://www.loraserver.io/img/sponsors/sidn_fonds.png)](https://www.sidnfonds.nl/)
 [![acklio](https://www.loraserver.io/img/sponsors/acklio.png)](http://www.ackl.io/)
 
 ## License

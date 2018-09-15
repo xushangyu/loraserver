@@ -7,6 +7,12 @@ Vagrantfile
 # logs
 *.log
 
+# configuration
+*.toml
+
+# dependencies
+vendor/
+
 # certs
 certs/
 

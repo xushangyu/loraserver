@@ -1,25 +1,27 @@
 package uplink
 
 import (
-	"bytes"
-	"encoding/gob"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"time"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/gomodule/redigo/redis"
+	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/helpers"
 	"github.com/brocaar/loraserver/internal/models"
 	"github.com/brocaar/lorawan"
-	"github.com/garyburd/redigo/redis"
 )
 
 // Templates used for generating Redis keys
 const (
-	CollectKeyTempl     = "loraserver:rx:collect:%s"
-	CollectLockKeyTempl = "loraserver:rx:collect:%s:lock"
+	CollectKeyTempl     = "lora:ns:rx:collect:%s"
+	CollectLockKeyTempl = "lora:ns:rx:collect:%s:lock"
 )
 
 // collectAndCallOnce collects the package, sleeps the configured duraction and
@@ -30,81 +32,98 @@ const (
 // It is safe to collect the same packet received by the same gateway twice.
 // Since the underlying storage type is a set, the result will always be a
 // unique set per gateway MAC and packet MIC.
-func collectAndCallOnce(p *redis.Pool, rxPacket gw.RXPacket, callback func(packet models.RXPacket) error) error {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(rxPacket); err != nil {
-		return fmt.Errorf("encode rx packet error: %s", err)
+func collectAndCallOnce(p *redis.Pool, rxPacket gw.UplinkFrame, callback func(packet models.RXPacket) error) error {
+	b, err := proto.Marshal(&rxPacket)
+	if err != nil {
+		return errors.Wrap(err, "marshal uplink frame error")
 	}
+
 	c := p.Get()
 	defer c.Close()
 
 	// store the packet in a set with DeduplicationDelay expiration
 	// in case the packet is received by multiple gateways, the set will contain
 	// each packet.
-	// since we can't trust the MIC (in case of a join-request, it will be
-	// validated after the collect), we generate a new one and use it as the
-	// hash for the storage key.
-	if err := rxPacket.PHYPayload.SetMIC(lorawan.AES128Key{}); err != nil {
-		return fmt.Errorf("set mic error: %s", err)
-	}
-
-	mic := hex.EncodeToString(rxPacket.PHYPayload.MIC[:])
-	key := fmt.Sprintf(CollectKeyTempl, mic)
-	lockKey := fmt.Sprintf(CollectLockKeyTempl, mic)
+	// The text representation of the PHYPayload is used as key.
+	phyKey := hex.EncodeToString(rxPacket.PhyPayload)
+	key := fmt.Sprintf(CollectKeyTempl, phyKey)
+	lockKey := fmt.Sprintf(CollectLockKeyTempl, phyKey)
 
 	// this way we can set a really low DeduplicationDelay for testing, without
 	// the risk that the set already expired in redis on read
-	deduplicationTTL := common.DeduplicationDelay * 2
+	deduplicationTTL := config.C.NetworkServer.DeduplicationDelay * 2
 	if deduplicationTTL < time.Millisecond*200 {
 		deduplicationTTL = time.Millisecond * 200
 	}
 
 	c.Send("MULTI")
-	c.Send("SADD", key, buf.Bytes())
+	c.Send("SADD", key, b)
 	c.Send("PEXPIRE", key, int64(deduplicationTTL)/int64(time.Millisecond))
-	_, err := c.Do("EXEC")
+	_, err = c.Do("EXEC")
 	if err != nil {
-		return fmt.Errorf("add rx packet to collect set error: %s", err)
+		return errors.Wrap(err, "add uplink frame to set error")
 	}
 
 	// acquire a lock on processing this packet
-	_, err = redis.String((c.Do("SET", lockKey, "lock", "PX", int64(deduplicationTTL)/int64(time.Millisecond), "NX")))
+	_, err = redis.String(c.Do("SET", lockKey, "lock", "PX", int64(deduplicationTTL)/int64(time.Millisecond), "NX"))
 	if err != nil {
 		if err == redis.ErrNil {
 			// the packet processing is already locked by an other process
 			// so there is nothing to do anymore :-)
 			return nil
 		}
-		return fmt.Errorf("acquire lock error: %s", err)
+		return errors.Wrap(err, "acquire deduplication lock error")
 	}
 
 	// wait the configured amount of time, more packets might be received
 	// from other gateways
-	time.Sleep(common.DeduplicationDelay)
+	time.Sleep(config.C.NetworkServer.DeduplicationDelay)
 
 	// collect all packets from the set
-	var rxPacketWithRXInfoSet models.RXPacket
 	payloads, err := redis.ByteSlices(c.Do("SMEMBERS", key))
 	if err != nil {
-		return fmt.Errorf("get collect set members error: %s", err)
+		return errors.Wrap(err, "get deduplication set members error")
 	}
 	if len(payloads) == 0 {
 		return errors.New("zero items in collect set")
 	}
 
+	var out models.RXPacket
 	for i, b := range payloads {
-		var packet gw.RXPacket
-		if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&packet); err != nil {
-			return fmt.Errorf("decode rx packet error: %s", err)
+		var uplinkFrame gw.UplinkFrame
+		if err := proto.Unmarshal(b, &uplinkFrame); err != nil {
+			return errors.Wrap(err, "unmarshal uplink frame error")
+		}
+
+		if uplinkFrame.TxInfo == nil {
+			log.Warning("tx-info of uplink frame is empty, skipping")
+			continue
+		}
+
+		if uplinkFrame.RxInfo == nil {
+			log.Warning("rx-info of uplink frame is empty, skipping")
+			continue
 		}
 
 		if i == 0 {
-			rxPacketWithRXInfoSet.PHYPayload = packet.PHYPayload
+			var phy lorawan.PHYPayload
+			if err := phy.UnmarshalBinary(uplinkFrame.PhyPayload); err != nil {
+				return errors.Wrap(err, "unmarshal phypayload error")
+			}
+
+			out.PHYPayload = phy
+
+			dr, err := helpers.GetDataRateIndex(true, uplinkFrame.TxInfo, config.C.NetworkServer.Band.Band)
+			if err != nil {
+				return errors.Wrap(err, "get data-rate index error")
+			}
+			out.DR = dr
 		}
-		rxPacketWithRXInfoSet.RXInfoSet = append(rxPacketWithRXInfoSet.RXInfoSet, packet.RXInfo)
+
+		out.TXInfo = uplinkFrame.TxInfo
+		out.RXInfoSet = append(out.RXInfoSet, uplinkFrame.RxInfo)
 	}
 
-	sort.Sort(rxPacketWithRXInfoSet.RXInfoSet)
-	return callback(rxPacketWithRXInfoSet)
+	sort.Sort(models.BySignalStrength(out.RXInfoSet))
+	return callback(out)
 }

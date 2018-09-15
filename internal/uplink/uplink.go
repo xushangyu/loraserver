@@ -1,45 +1,22 @@
 package uplink
 
 import (
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/jmoiron/sqlx"
 
 	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/framelog"
+	"github.com/brocaar/loraserver/internal/gateway"
 	"github.com/brocaar/loraserver/internal/models"
-	"github.com/brocaar/loraserver/internal/node"
+	"github.com/brocaar/loraserver/internal/uplink/data"
+	"github.com/brocaar/loraserver/internal/uplink/join"
+	"github.com/brocaar/loraserver/internal/uplink/proprietary"
+	"github.com/brocaar/loraserver/internal/uplink/rejoin"
 	"github.com/brocaar/lorawan"
-)
-
-var flow = NewFlow().JoinRequest(
-	setContextFromJoinRequestPHYPayload,
-	logJoinRequestFramesCollected,
-	getRandomDevAddr,
-	getOptionalCFList,
-	getJoinAcceptFromAS,
-	logJoinRequestFrame,
-	createNodeSession,
-	sendJoinAcceptDownlink,
-).DataUp(
-	setContextFromDataPHYPayload,
-	getNodeSessionForDataUp,
-	logDataFramesCollected,
-	decryptFRMPayloadMACCommands,
-	sendRXInfoToNetworkController,
-	handleFOptsMACCommands,
-	handleFRMPayloadMACCommands,
-	sendFRMPayloadToApplicationServer,
-	handleChannelReconfiguration,
-	handleADR,
-	setLastRXInfoSet,
-	syncUplinkFCnt,
-	saveNodeSession,
-	handleUplinkACK,
-	handleDownlink,
 )
 
 // Server represents a server listening for uplink packets.
@@ -65,7 +42,7 @@ func (s *Server) Start() error {
 // Stop closes the gateway backend and waits for the server to complete the
 // pending packets.
 func (s *Server) Stop() error {
-	if err := common.Gateway.Close(); err != nil {
+	if err := config.C.NetworkServer.Gateway.Backend.Backend.Close(); err != nil {
 		return fmt.Errorf("close gateway backend error: %s", err)
 	}
 	log.Info("waiting for pending actions to complete")
@@ -76,53 +53,51 @@ func (s *Server) Stop() error {
 // HandleRXPackets consumes received packets by the gateway and handles them
 // in a separate go-routine. Errors are logged.
 func HandleRXPackets(wg *sync.WaitGroup) {
-	for rxPacket := range common.Gateway.RXPacketChan() {
-		go func(rxPacket gw.RXPacket) {
+	for uplinkFrame := range config.C.NetworkServer.Gateway.Backend.Backend.RXPacketChan() {
+		go func(uplinkFrame gw.UplinkFrame) {
 			wg.Add(1)
 			defer wg.Done()
-			if err := HandleRXPacket(rxPacket); err != nil {
-				data, _ := rxPacket.PHYPayload.MarshalText()
-				log.WithField("data_base64", string(data)).Errorf("processing rx packet error: %s", err)
+			if err := HandleRXPacket(uplinkFrame); err != nil {
+				data := base64.StdEncoding.EncodeToString(uplinkFrame.PhyPayload)
+				log.WithField("data_base64", data).WithError(err).Error("processing uplink frame error")
 			}
-		}(rxPacket)
+		}(uplinkFrame)
 	}
 }
 
 // HandleRXPacket handles a single rxpacket.
-func HandleRXPacket(rxPacket gw.RXPacket) error {
-	return collectPackets(rxPacket)
+func HandleRXPacket(uplinkFrame gw.UplinkFrame) error {
+	return collectPackets(uplinkFrame)
 }
 
-func collectPackets(rxPacket gw.RXPacket) error {
-	return collectAndCallOnce(common.RedisPool, rxPacket, func(rxPacket models.RXPacket) error {
-		return flow.Run(rxPacket)
+func collectPackets(uplinkFrame gw.UplinkFrame) error {
+	return collectAndCallOnce(config.C.Redis.Pool, uplinkFrame, func(rxPacket models.RXPacket) error {
+		// update the gateway meta-data
+		if err := gateway.UpdateMetaDataInRxInfoSet(config.C.PostgreSQL.DB, config.C.Redis.Pool, rxPacket.RXInfoSet); err != nil {
+			log.WithError(err).Error("update gateway meta-data in rx-info set error")
+		}
+
+		// log the frame for each receiving gatewa
+		if err := framelog.LogUplinkFrameForGateways(gw.UplinkFrameSet{
+			PhyPayload: uplinkFrame.PhyPayload,
+			TxInfo:     rxPacket.TXInfo,
+			RxInfo:     rxPacket.RXInfoSet,
+		}); err != nil {
+			log.WithError(err).Error("log uplink frames for gateways error")
+		}
+
+		// handle the frame based on message-type
+		switch rxPacket.PHYPayload.MHDR.MType {
+		case lorawan.JoinRequest:
+			return join.Handle(rxPacket)
+		case lorawan.RejoinRequest:
+			return rejoin.Handle(rxPacket)
+		case lorawan.UnconfirmedDataUp, lorawan.ConfirmedDataUp:
+			return data.Handle(rxPacket)
+		case lorawan.Proprietary:
+			return proprietary.Handle(rxPacket)
+		default:
+			return nil
+		}
 	})
-}
-
-func logUplink(db *sqlx.DB, devEUI lorawan.EUI64, rxPacket models.RXPacket) {
-	if !common.LogNodeFrames {
-		return
-	}
-
-	phyB, err := rxPacket.PHYPayload.MarshalBinary()
-	if err != nil {
-		log.Errorf("marshal phypayload to binary error: %s", err)
-		return
-	}
-
-	rxB, err := json.Marshal(rxPacket.RXInfoSet)
-	if err != nil {
-		log.Errorf("marshal rx-info set to json error: %s", err)
-		return
-	}
-
-	fl := node.FrameLog{
-		DevEUI:     devEUI,
-		RXInfoSet:  &rxB,
-		PHYPayload: phyB,
-	}
-	err = node.CreateFrameLog(db, &fl)
-	if err != nil {
-		log.Errorf("create frame-log error: %s", err)
-	}
 }
